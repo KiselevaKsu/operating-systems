@@ -53,7 +53,6 @@ private:
     }
 
     void setup() {
-        // защита от повторного запуска
         checkAndKillOldProcess();
 
         // запись pid
@@ -65,7 +64,6 @@ private:
         openlog("lab1_daemon", LOG_PID | LOG_CONS, LOG_USER);
         syslog(LOG_INFO, "Daemon started, PID: %d", getpid());
 
-        // обработка сигналов
         signal(SIGHUP, signalHandler);
         signal(SIGTERM, signalHandler);
 
@@ -83,7 +81,17 @@ private:
                 if (fs::exists(procPath)) {
                     syslog(LOG_INFO, "Old daemon (PID %d) is running. Sending SIGTERM.", oldPid);
                     kill(oldPid, SIGTERM);
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    
+                    // ждем реального завершения старого процесса (максимум 5 секунд)
+                    int waitCount = 0;
+                    while (fs::exists(procPath) && waitCount < 50) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        waitCount++;
+                    }
+                    if (fs::exists(procPath)) {
+                        syslog(LOG_WARNING, "Old daemon didn't finish in time, sending SIGKILL.");
+                        kill(oldPid, SIGKILL);
+                    }
                 }
             }
         }
@@ -91,7 +99,7 @@ private:
 
     void readConfig() {
         config.clear();
-        interval = 20; // сброс на дефолт при перечитывании
+        interval = 20; 
         std::ifstream file(configPath);
         if (!file.is_open()) {
             syslog(LOG_ERR, "Cannot open config: %s", configPath.c_str());
@@ -105,7 +113,19 @@ private:
             iss >> first;
             
             if (first == "interval") {
-                iss >> interval;
+                std::string valStr;
+                if (iss >> valStr) {
+                    try {
+                        int val = std::stoi(valStr);
+                        if (val > 0) {
+                            interval = val;
+                        } else {
+                            syslog(LOG_WARNING, "Invalid interval %s, using default 20.", valStr.c_str());
+                        }
+                    } catch (...) {
+                        syslog(LOG_WARNING, "Invalid interval format %s, using default 20.", valStr.c_str());
+                    }
+                }
             } else {
                 int depth;
                 if (iss >> depth) {
@@ -119,44 +139,38 @@ private:
     void deleteSubfolders(const std::string& basePath, int maxDepth) {
         if (!fs::exists(basePath) || !fs::is_directory(basePath)) return;
 
-        std::vector<std::string> dirsToKeep;
+        std::function<void(const std::string&, int)> traverse = [&](const std::string& currentPath, int currentDepth) {
+            DIR* dir = opendir(currentPath.c_str());
+            if (!dir) return;
 
-        // 1. находим все папки, которые НЕ надо удалять (глубина > maxDepth)
-        std::function<void(const std::string&, int)> findDirsToKeep = [&](const std::string& currentPath, int currentDepth) {
-            for (const auto& entry : fs::directory_iterator(currentPath)) {
-                if (entry.is_directory()) {
-                    if (currentDepth > maxDepth) {
-                        dirsToKeep.push_back(entry.path().string());
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != nullptr) {
+                std::string name = entry->d_name;
+                if (name == "." || name == "..") continue;
+                
+                std::string fullPath = currentPath + "/" + name;
+                struct stat statbuf;
+                
+                if (stat(fullPath.c_str(), &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
+                    // если мы достигли нужной глубины, удаляем папку целиком
+                    if (currentDepth == maxDepth) {
+                        try {
+                            fs::remove_all(fullPath);
+                            syslog(LOG_INFO, "Deleted: %s", fullPath.c_str());
+                        } catch (const std::exception& e) {
+                            syslog(LOG_ERR, "Failed to delete %s: %s", fullPath.c_str(), e.what());
+                        }
                     } else {
-                        findDirsToKeep(entry.path().string(), currentDepth + 1);
+                        // иначе идем глубже
+                        traverse(fullPath, currentDepth + 1);
                     }
                 }
             }
+            closedir(dir);
         };
-        
-        // начинаем с 1-го уровня вложенности
-        findDirsToKeep(basePath, 1);
 
-        // 2. удаляем всё содержимое basePath
-        for (const auto& entry : fs::directory_iterator(basePath)) {
-            std::string pathStr = entry.path().string();
-            try {
-                fs::remove_all(entry.path());
-                syslog(LOG_INFO, "Deleted: %s", pathStr.c_str());
-            } catch (const std::exception& e) {
-                syslog(LOG_ERR, "Failed to delete %s: %s", pathStr.c_str(), e.what());
-            }
-        }
-
-        // 3. восстанавливаем папки, которые нужно было сохранить
-        for (const auto& keepDir : dirsToKeep) {
-            try {
-                fs::create_directories(keepDir);
-                syslog(LOG_INFO, "Restored (kept): %s", keepDir.c_str());
-            } catch (const std::exception& e) {
-                syslog(LOG_ERR, "Failed to restore %s: %s", keepDir.c_str(), e.what());
-            }
-        }
+        // начинаем с 1-го уровня (файлы в корне basePath не трогаем)
+        traverse(basePath, 1);
     }
 
     void doWork() {
@@ -176,7 +190,7 @@ private:
             }
             doWork();
 
-            // ждем, проверяя сигналы
+            // ждем interval секунд, проверяя сигналы
             for (int i = 0; i < interval; ++i) {
                 if (terminateFlag || reloadFlag) break;
                 std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -185,7 +199,17 @@ private:
         
         syslog(LOG_INFO, "Daemon is terminating.");
         closelog();
-        fs::remove(pidFilePath);
+        
+        // удаляем pid-файл только если он наш!
+        std::ifstream pidFile(pidFilePath);
+        if (pidFile.is_open()) {
+            pid_t currentPid;
+            pidFile >> currentPid;
+            pidFile.close();
+            if (currentPid == getpid()) {
+                fs::remove(pidFilePath);
+            }
+        }
     }
 };
 
