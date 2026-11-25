@@ -22,7 +22,7 @@ std::string ClientToHost(pid_t pid) {
 }
 
 bool WaitSemaphore(sem_t* sem, int timeout_ms) {
-    if (timeout_ms == 0) {
+    if (timeout_ms <= 0) {
         return sem_trywait(sem) == 0;
     }
 
