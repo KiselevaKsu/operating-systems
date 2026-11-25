@@ -10,7 +10,7 @@
 namespace {
 
 bool WaitSemaphore(sem_t* sem, int timeout_ms) {
-    if (timeout_ms == 0) {
+    if (timeout_ms <= 0) {
         return sem_trywait(sem) == 0;
     }
 
@@ -83,6 +83,11 @@ bool Transfer(int fd, void* data, std::size_t size,
             count = send(fd, bytes + done, size - done, MSG_NOSIGNAL);
         } else {
             count = recv(fd, bytes + done, size - done, 0);
+        }
+
+        if (count < 0 &&
+            (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
         }
 
         if (count <= 0) {

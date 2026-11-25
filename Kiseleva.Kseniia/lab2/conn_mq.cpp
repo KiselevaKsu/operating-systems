@@ -1,16 +1,20 @@
+
 #include "connection.h"
 
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <fcntl.h>
 #include <mqueue.h>
+#include <memory>
 #include <string>
 #include <thread>
 #include <time.h>
 
 namespace {
+
+constexpr long MAX_MESSAGES = 10;
+constexpr auto RETRY_INTERVAL = std::chrono::milliseconds(5);
 
 std::string HostToClient(pid_t pid) {
     return "/lab2_mq_" + std::to_string(pid) + "_h2c";
@@ -21,7 +25,7 @@ std::string ClientToHost(pid_t pid) {
 }
 
 bool WaitSemaphore(sem_t* sem, int timeout_ms) {
-    if (timeout_ms == 0) {
+    if (timeout_ms <= 0) {
         return sem_trywait(sem) == 0;
     }
 
@@ -40,6 +44,7 @@ bool WaitSemaphore(sem_t* sem, int timeout_ms) {
         if (errno == EINTR) {
             continue;
         }
+
         return false;
     }
 
@@ -49,21 +54,28 @@ bool WaitSemaphore(sem_t* sem, int timeout_ms) {
 class MqConnection final : public Connection {
 public:
     MqConnection(ProcessRole role, pid_t pid, SharedSync* sync)
-        : role_(role), sync_(sync) {
+        : role_(role), sync_(sync), pid_(pid) {
+
         const std::string h2c = HostToClient(pid);
         const std::string c2h = ClientToHost(pid);
 
         if (role == ProcessRole::Host) {
             mq_attr attr{};
-            attr.mq_maxmsg = 10;
+            attr.mq_maxmsg = MAX_MESSAGES;
             attr.mq_msgsize = sizeof(ChatMessage);
 
             host_to_client_ = mq_open(
-                h2c.c_str(), O_CREAT | O_RDWR, 0600, &attr
+                h2c.c_str(),
+                O_CREAT | O_RDWR | O_NONBLOCK,
+                0600,
+                &attr
             );
 
             client_to_host_ = mq_open(
-                c2h.c_str(), O_CREAT | O_RDWR, 0600, &attr
+                c2h.c_str(),
+                O_CREAT | O_RDWR | O_NONBLOCK,
+                0600,
+                &attr
             );
         } else {
             const auto deadline =
@@ -71,23 +83,21 @@ public:
                 std::chrono::seconds(5);
 
             while (std::chrono::steady_clock::now() < deadline) {
-                host_to_client_ = mq_open(h2c.c_str(), O_RDWR);
-                client_to_host_ = mq_open(c2h.c_str(), O_RDWR);
+                host_to_client_ = mq_open(
+                    h2c.c_str(),
+                    O_RDWR | O_NONBLOCK
+                );
 
-                if (host_to_client_ != static_cast<mqd_t>(-1) &&
-                    client_to_host_ != static_cast<mqd_t>(-1)) {
+                client_to_host_ = mq_open(
+                    c2h.c_str(),
+                    O_RDWR | O_NONBLOCK
+                );
+
+                if (IsValid()) {
                     break;
                 }
 
-                if (host_to_client_ != static_cast<mqd_t>(-1)) {
-                    mq_close(host_to_client_);
-                    host_to_client_ = static_cast<mqd_t>(-1);
-                }
-
-                if (client_to_host_ != static_cast<mqd_t>(-1)) {
-                    mq_close(client_to_host_);
-                    client_to_host_ = static_cast<mqd_t>(-1);
-                }
+                CloseQueues();
 
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(50)
@@ -97,21 +107,20 @@ public:
     }
 
     ~MqConnection() override {
-        if (host_to_client_ != static_cast<mqd_t>(-1)) {
-            mq_close(host_to_client_);
-        }
-
-        if (client_to_host_ != static_cast<mqd_t>(-1)) {
-            mq_close(client_to_host_);
-        }
+        CloseQueues();
 
         if (role_ == ProcessRole::Host) {
-            const std::string h2c = HostToClient(getpid());
-            const std::string c2h = ClientToHost(getpid());
+            const std::string h2c = HostToClient(pid_);
+            const std::string c2h = ClientToHost(pid_);
 
             mq_unlink(h2c.c_str());
             mq_unlink(c2h.c_str());
         }
+    }
+
+    bool IsValid() const {
+        return host_to_client_ != static_cast<mqd_t>(-1) &&
+               client_to_host_ != static_cast<mqd_t>(-1);
     }
 
     bool Read(ChatMessage& message, int timeout_ms) override {
@@ -127,11 +136,7 @@ public:
             ? client_to_host_
             : host_to_client_;
 
-        const auto deadline =
-            std::chrono::steady_clock::now() +
-            std::chrono::milliseconds(5000);
-
-        while (std::chrono::steady_clock::now() < deadline) {
+        for (;;) {
             const ssize_t result = mq_receive(
                 queue,
                 reinterpret_cast<char*>(&message),
@@ -143,16 +148,12 @@ public:
                 return true;
             }
 
-            if (errno != EAGAIN && errno != EINTR) {
-                return false;
+            if (result == -1 && errno == EINTR) {
+                continue;
             }
 
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(5)
-            );
+            return false;
         }
-
-        return false;
     }
 
     bool Write(const ChatMessage& message, int timeout_ms) override {
@@ -168,7 +169,7 @@ public:
             std::chrono::steady_clock::now() +
             std::chrono::milliseconds(timeout_ms);
 
-        while (std::chrono::steady_clock::now() < deadline) {
+        while (true) {
             if (mq_send(
                     queue,
                     reinterpret_cast<const char*>(&message),
@@ -178,21 +179,40 @@ public:
                 return sem_post(sem) == 0;
             }
 
-            if (errno != EAGAIN && errno != EINTR) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (errno != EAGAIN) {
                 return false;
             }
 
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(5)
-            );
-        }
+            if (timeout_ms <= 0 ||
+                std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
 
-        return false;
+            std::this_thread::sleep_for(RETRY_INTERVAL);
+        }
     }
 
 private:
+    void CloseQueues() {
+        if (host_to_client_ != static_cast<mqd_t>(-1)) {
+            mq_close(host_to_client_);
+            host_to_client_ = static_cast<mqd_t>(-1);
+        }
+
+        if (client_to_host_ != static_cast<mqd_t>(-1)) {
+            mq_close(client_to_host_);
+            client_to_host_ = static_cast<mqd_t>(-1);
+        }
+    }
+
     ProcessRole role_;
     SharedSync* sync_;
+    pid_t pid_;
+
     mqd_t host_to_client_{static_cast<mqd_t>(-1)};
     mqd_t client_to_host_{static_cast<mqd_t>(-1)};
 };
@@ -209,5 +229,15 @@ ConnectionPtr CreateConnection(
     SharedSync* sync,
     int
 ) {
-    return std::make_unique<MqConnection>(role, host_pid, sync);
+    auto connection = std::make_unique<MqConnection>(
+        role,
+        host_pid,
+        sync
+    );
+
+    if (!connection->IsValid()) {
+        return nullptr;
+    }
+
+    return connection;
 }

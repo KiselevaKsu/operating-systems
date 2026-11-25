@@ -13,10 +13,14 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <iostream>
+#include <string>
+#include <vector>
+
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -48,6 +52,33 @@ QString TimeString(std::uint64_t timestamp) {
     return QString("%1.%2")
         .arg(seconds)
         .arg(milliseconds, 3, 10, QChar('0'));
+}
+
+// Добавляет сообщение в историю и сортирует её по времени.
+void AddMessage(
+    std::vector<ChatMessage>& history,
+    QTextEdit* messages,
+    const ChatMessage& message
+) {
+    history.push_back(message);
+
+    std::stable_sort(
+        history.begin(),
+        history.end(),
+        [](const ChatMessage& left, const ChatMessage& right) {
+            return left.timestamp_ms < right.timestamp_ms;
+        }
+    );
+
+    messages->clear();
+
+    for (const auto& item : history) {
+        messages->append(
+            "[" + TimeString(item.timestamp_ms) +
+            "] " + QString::fromUtf8(item.sender) +
+            ": " + QString::fromUtf8(item.text)
+        );
+    }
 }
 
 } // namespace
@@ -131,6 +162,9 @@ int main(int argc, char* argv[]) {
     auto* messages = new QTextEdit(central);
     messages->setReadOnly(true);
 
+    // Общая история сообщений хоста.
+    std::vector<ChatMessage> history;
+
     auto* type = new QComboBox(central);
     type->addItem("Публичное сообщение");
     type->addItem("Личное сообщение");
@@ -163,6 +197,7 @@ int main(int argc, char* argv[]) {
     auto last_heartbeat =
         std::chrono::steady_clock::now();
 
+    // Отправка сообщения от хоста.
     QObject::connect(send, &QPushButton::clicked, [&]() {
         if (!client_alive) {
             return;
@@ -208,10 +243,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (connection->Write(message, 5000)) {
-            messages->append(
-                "[" + TimeString(message.timestamp_ms) +
-                "] host: " + text
-            );
+            AddMessage(history, messages, message);
         } else {
             status->setText("Ошибка отправки сообщения");
         }
@@ -235,6 +267,7 @@ int main(int argc, char* argv[]) {
 
         const auto now = std::chrono::steady_clock::now();
 
+        // Периодическая проверка активности клиента.
         if (now - last_heartbeat >= std::chrono::seconds(2)) {
             ChatMessage heartbeat{};
 
@@ -272,18 +305,19 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            messages->append(
-                "[" + TimeString(message.timestamp_ms) +
-                "] " + QString::fromUtf8(message.sender) +
-                ": " + QString::fromUtf8(message.text)
-            );
+            // Добавляем полученное сообщение в хронологическую историю.
+            AddMessage(history, messages, message);
 
-            if (message.type == MessageType::Public) {
-                message.timestamp_ms = Timestamp();
+            // В чате 1:1 возвращаем сообщение клиенту:
+            // публичное — для отображения участнику,
+            // приватное — как эхо отправителю.
+            if (message.type == MessageType::Public ||
+                (message.type == MessageType::Private &&
+                std::string(message.recipient) == "host")) {
 
                 if (!connection->Write(message, 1000)) {
                     status->setText(
-                        "Не удалось переслать сообщение"
+                        "Не удалось переслать сообщение клиенту"
                     );
                 }
             }
@@ -293,6 +327,7 @@ int main(int argc, char* argv[]) {
         if (client_alive &&
             std::chrono::steady_clock::now() -
                 last_client_activity > std::chrono::seconds(60)) {
+
             kill(child, SIGKILL);
             client_alive = false;
 
@@ -353,7 +388,6 @@ int main(int argc, char* argv[]) {
                     usleep(50000);
                 }
 
-                // Если клиент не завершился самостоятельно, завершаем его принудительно.
                 if (result == 0) {
                     kill(child, SIGKILL);
                     waitpid(child, nullptr, 0);
